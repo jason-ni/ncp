@@ -15,6 +15,9 @@ pub use stream::{NcpStreamReader, NcpStreamWriter};
 use tokio::net::udp::SendHalf;
 use tokio::sync::mpsc::error::TrySendError;
 
+const MAX_INTERVAL: u32 = 200;
+const MIN_INTERVAL: u32 = 10;
+
 pub struct NcpStreamInner {
     write_wnd: i16,
     send_wnd_limit: u32,
@@ -28,6 +31,9 @@ pub struct NcpStreamInner {
     now: u32,
     closing: bool,
     closing_sn: u32,
+    rto: u32,
+    srtt: u32,
+    rttval: u32,
 }
 
 #[derive(Debug)]
@@ -42,6 +48,7 @@ pub struct NcpSegment {
     seg_no: u32,
     state: SegState,
     timestamp: u32,
+    rexmit_timestamp: u32,
     data: Option<Vec<u8>>,
 }
 
@@ -140,11 +147,13 @@ async fn ncp_loop(
         now: 0,
         closing: false,
         closing_sn: 0,
+        rto: 200,
+        srtt: 0,
+        rttval: 0,
     };
     let (mut sock_recv_hf, mut sock_send_hf) = udp_sock.split();
     let mut buf = BytesMut::with_capacity(1024);
-    let mut check_arp_inverval = tokio::time::interval(std::time::Duration::from_secs(3));
-
+    let mut check_arp_inverval = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         log::debug!("loop begin");
         buf.resize(1024, 0u8);
@@ -155,6 +164,13 @@ async fn ncp_loop(
                         log::debug!("received data: {:?}", &buf[..size]);
                         let frame = read_frame(&buf[..size]);
                         log::debug!("received frame: {:?}", frame);
+                        log::debug!("whether to drop: {} - {}", ncp_inner.now, (ncp_inner.now % 50));
+                        fastrand::seed(now_millis() as u64);
+                        let threshold = fastrand::u32(..20);
+                        if threshold.eq(&0) {
+                            log::debug!("--- error injection: drop segment {} intentionally. threshold: {}", frame.sn, threshold);
+                            continue
+                        }
                         HandleMsg::RecvData(frame, peer_addr)
                     }
                     Err(e) => {
@@ -191,8 +207,11 @@ async fn ncp_loop(
         match msg {
             HandleMsg::RecvData(frame, peer_addr) => match frame.cmd {
                 CMD_PUSH => {
-                    log::debug!("received push data: {:?}", &frame.data);
+                    log::debug!("received push data: {:?}", &frame);
+                    log::debug!("recv_buf: {:?}", ncp_inner.recv_buf);
                     if frame.sn.lt(&ncp_inner.recv_next) {
+                        send_ack(frame.sn, ncp_inner.recv_next, &mut sock_send_hf, &peer_addr)
+                            .await?;
                         continue;
                     }
                     let mut idx = 0;
@@ -200,11 +219,14 @@ async fn ncp_loop(
                     for i in ncp_inner.recv_buf.iter() {
                         if frame.sn.eq(&i.seg_no) {
                             insert = false;
-                            send_ack(frame.sn, &mut sock_send_hf, &peer_addr).await?;
+                            send_ack(frame.sn, ncp_inner.recv_next, &mut sock_send_hf, &peer_addr)
+                                .await?;
                             break;
                         } else {
                             if frame.sn.lt(&i.seg_no) {
                                 break;
+                            } else {
+                                idx += 1;
                             }
                         }
                     }
@@ -215,6 +237,7 @@ async fn ncp_loop(
                                 seg_no: frame.sn,
                                 state: SegState::Init,
                                 timestamp: frame.ts,
+                                rexmit_timestamp: 0,
                                 data: if frame.data.len().eq(&0) {
                                     None
                                 } else {
@@ -223,12 +246,14 @@ async fn ncp_loop(
                             },
                         );
                         log::debug!("inserted seg to recv_buf: {:?}", ncp_inner.recv_buf);
-                        send_ack(frame.sn, &mut sock_send_hf, &peer_addr).await?;
+                        send_ack(frame.sn, ncp_inner.recv_next, &mut sock_send_hf, &peer_addr)
+                            .await?;
                     }
                 }
                 CMD_ACK => {
                     log::debug!("send_buf: {:?}", ncp_inner.send_buf);
                     log::debug!("send_queue: {:?}", ncp_inner.send_queue);
+                    let mut seg_rtt = 0;
                     for i in ncp_inner.send_buf.iter_mut() {
                         log::debug!(
                             "checking ack seg_no: {}, frame.sn: {}, frame.len: {}",
@@ -236,10 +261,20 @@ async fn ncp_loop(
                             frame.sn,
                             frame.len
                         );
-                        if i.seg_no.eq(&frame.sn) {
+                        if i.seg_no.eq(&frame.sn) || i.seg_no.lt(&frame.una) {
                             log::debug!("=== setting segment {} to sent state", i.seg_no);
                             i.state = SegState::Sent;
+                            seg_rtt = ncp_inner.now - i.timestamp;
                         }
+                    }
+                    if seg_rtt.gt(&0) {
+                        update_rtt(&mut ncp_inner, seg_rtt);
+                        log::debug!(
+                            "--- segment {} rtt: {}, rto: {}",
+                            frame.sn,
+                            seg_rtt,
+                            ncp_inner.rto
+                        );
                     }
                     let mut pop_count = 0;
                     for i in ncp_inner.send_buf.iter_mut() {
@@ -288,12 +323,19 @@ async fn ncp_loop(
                     seg_no,
                     state: SegState::Init,
                     timestamp: ncp_inner.now,
+                    rexmit_timestamp: ncp_inner.now + ncp_inner.rto + (ncp_inner.rto >> 3),
                     data: Some(write_data),
                 });
                 ncp_inner.write_wnd -= 1;
             }
             HandleMsg::CheckResend => {
                 log::debug!("checking resend: recv_next: {}", ncp_inner.recv_next);
+                for i in ncp_inner.send_buf.iter_mut() {
+                    let diff = i32diff(ncp_inner.now, i.rexmit_timestamp);
+                    if diff.ge(&0) {
+                        send_segment(i, &mut sock_send_hf).await?;
+                    }
+                }
             }
             HandleMsg::Close => {
                 log::debug!("closing stream");
@@ -303,6 +345,7 @@ async fn ncp_loop(
                     seg_no,
                     state: SegState::Init,
                     timestamp: ncp_inner.now,
+                    rexmit_timestamp: ncp_inner.now + ncp_inner.rto + (ncp_inner.rto >> 3),
                     data: None,
                 });
             }
@@ -331,7 +374,8 @@ async fn ncp_loop(
             }
         }
 
-        while let Some(mut seg) = ncp_inner.recv_buf.pop_front() {
+        let mut recv_cnt = 0;
+        for seg in ncp_inner.recv_buf.iter_mut() {
             log::debug!("checking recv seg: {:?}", seg);
             if seg.seg_no.eq(&ncp_inner.recv_next) {
                 let mut closing = false;
@@ -349,6 +393,11 @@ async fn ncp_loop(
                 match read_tx.try_send(read_noty) {
                     Ok(()) => {
                         ncp_inner.recv_next += 1;
+                        recv_cnt += 1;
+                        log::debug!(
+                            "advanced recv_next: {}, sent to reader",
+                            ncp_inner.recv_next
+                        );
                         if closing {
                             let _ = write_noty_tx.send(WriterNoty::Closed).map_err(|e| {
                                 log::error!("failed to send WriterNoty::Closed");
@@ -366,7 +415,6 @@ async fn ncp_loop(
                             }
                             ReadNoty::Eof => (),
                         }
-                        ncp_inner.recv_buf.push_front(seg);
                         break;
                     }
                 }
@@ -374,7 +422,31 @@ async fn ncp_loop(
                 break;
             }
         }
+        while recv_cnt.gt(&0) {
+            ncp_inner.recv_buf.pop_front();
+            recv_cnt -= 1;
+        }
     }
+}
+
+fn update_rtt(ncp_inner: &mut NcpStreamInner, rtt: u32) {
+    if ncp_inner.srtt == 0 {
+        ncp_inner.srtt = rtt;
+        ncp_inner.rttval = rtt / 2;
+    } else {
+        let delta = if rtt > ncp_inner.srtt {
+            rtt - ncp_inner.srtt
+        } else {
+            ncp_inner.srtt - rtt
+        };
+        ncp_inner.rttval = (3 * ncp_inner.rttval + delta) / 4;
+        ncp_inner.srtt = (7 * ncp_inner.srtt + rtt) / 8;
+        if ncp_inner.srtt < 1 {
+            ncp_inner.srtt = 1;
+        }
+    }
+    let rto = ncp_inner.srtt + std::cmp::max(MAX_INTERVAL, 4 * ncp_inner.rttval);
+    ncp_inner.rto = std::cmp::min(std::cmp::max(20, rto), 30000);
 }
 
 async fn send_segment(seg: &NcpSegment, write_stream: &mut SendHalf) -> Result<()> {
@@ -399,7 +471,12 @@ async fn send_segment(seg: &NcpSegment, write_stream: &mut SendHalf) -> Result<(
     Ok(())
 }
 
-async fn send_ack(seg_no: u32, write_stream: &mut SendHalf, peer_addr: &SocketAddr) -> Result<()> {
+async fn send_ack(
+    seg_no: u32,
+    recv_next: u32,
+    write_stream: &mut SendHalf,
+    peer_addr: &SocketAddr,
+) -> Result<()> {
     log::debug!("sending ack: {}", seg_no);
     let frame = NcpFrame {
         conv: 0,
@@ -408,7 +485,7 @@ async fn send_ack(seg_no: u32, write_stream: &mut SendHalf, peer_addr: &SocketAd
         wnd: 0,
         ts: 0,
         sn: seg_no,
-        una: 0,
+        una: recv_next,
         len: 0,
         data: Vec::new(),
     };
@@ -422,4 +499,9 @@ fn now_millis() -> u32 {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u32
+}
+
+#[inline(always)]
+fn i32diff(a: u32, b: u32) -> i32 {
+    a as i32 - b as i32
 }

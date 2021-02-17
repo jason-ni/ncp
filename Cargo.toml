@@ -9,6 +9,7 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0"
 bytes = "0.6.0"
+fastrand = "1.4.0"
 log = "0.4"
 env_logger = "0.7"
 pretty-hex = "0.2.1"
