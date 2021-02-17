@@ -9,7 +9,7 @@ async fn run() -> Result<()> {
     let mut buf = BytesMut::new();
     buf.extend_from_slice("0abcdefghijklmnopqrstuvwxyz1abcdefghijklmnopqrstuvwxyz2abcdefghijklmnopqrstuvwxyz3abcdefghijklmnopqrstuvwxyz4abcdefghijklmnopqrstuvwxyz".as_bytes());
     write_stream.write_all(buf.as_ref()).await?;
-    tokio::time::delay_for(std::time::Duration::from_secs(100)).await;
+    write_stream.shutdown().await?;
     Ok(())
 }
 
@@ -21,5 +21,7 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    let _ = rt.block_on(run());
+    let _ = rt
+        .block_on(run())
+        .map_err(|e| log::error!("run error: {:?}", e));
 }

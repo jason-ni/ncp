@@ -11,6 +11,7 @@ pub const MSS: u16 = MTU - 1398;
 pub const CMD_PUSH: u8 = 0;
 pub const CMD_ACK: u8 = 1;
 
+#[derive(Debug)]
 pub struct NcpFrame {
     pub conv: u32,
     pub cmd: u8,

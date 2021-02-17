@@ -9,21 +9,35 @@ use tokio::stream::Stream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
+#[derive(Debug)]
+pub enum WriteCmd {
+    Data(Vec<u8>),
+    Close,
+}
+
 pub struct NcpStreamWriter {
     pub write_wnd: i16,
-    pub write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub write_tx: mpsc::UnboundedSender<WriteCmd>,
     pub write_noty: mpsc::UnboundedReceiver<WriterNoty>,
+    pub closing: bool,
 }
 
 #[derive(Debug)]
 pub enum WriterNoty {
     WindowInc(i16),
+    Closed,
 }
 
 pub struct NcpStreamReader {
     pub pending_buf: Option<Vec<u8>>,
     pub last_read: usize,
-    pub read_rx: mpsc::Receiver<Vec<u8>>,
+    pub read_rx: mpsc::Receiver<ReadNoty>,
+}
+
+#[derive(Debug)]
+pub enum ReadNoty {
+    Data(Vec<u8>),
+    Eof,
 }
 
 impl AsyncRead for NcpStreamReader {
@@ -40,17 +54,20 @@ impl AsyncRead for NcpStreamReader {
             Poll::Ready(Ok(sendable))
         } else {
             match me.read_rx.poll_recv(cx) {
-                Poll::Ready(Some(s)) => {
-                    if s.len().le(&buf.len()) {
-                        buf.put_slice(s.as_slice());
-                        Poll::Ready(Ok(s.len()))
-                    } else {
-                        me.last_read = buf.len();
-                        buf.put_slice(&s.as_slice()[..me.last_read]);
-                        me.pending_buf.replace(s);
-                        Poll::Ready(Ok(me.last_read))
+                Poll::Ready(Some(n)) => match n {
+                    ReadNoty::Data(s) => {
+                        if s.len().le(&buf.len()) {
+                            buf.put_slice(s.as_slice());
+                            Poll::Ready(Ok(s.len()))
+                        } else {
+                            me.last_read = buf.len();
+                            buf.put_slice(&s.as_slice()[..me.last_read]);
+                            me.pending_buf.replace(s);
+                            Poll::Ready(Ok(me.last_read))
+                        }
                     }
-                }
+                    ReadNoty::Eof => Poll::Ready(Ok(0)),
+                },
                 Poll::Ready(None) => Poll::Ready(Ok(0)),
                 Poll::Pending => Poll::Pending,
             }
@@ -72,6 +89,7 @@ impl AsyncWrite for NcpStreamWriter {
                 match me.write_noty.try_recv() {
                     Ok(n) => match n {
                         WriterNoty::WindowInc(inc) => me.write_wnd += inc,
+                        WriterNoty::Closed => return Poll::Ready(Ok(0)),
                     },
                     Err(TryRecvError::Empty) => {
                         log::debug!("=== read noty empty");
@@ -85,6 +103,7 @@ impl AsyncWrite for NcpStreamWriter {
                                         me.write_wnd += inc;
                                         break;
                                     }
+                                    WriterNoty::Closed => return Poll::Ready(Ok(0)),
                                 },
                                 Poll::Ready(None) => {
                                     return Poll::Ready(Err(Error::from(ErrorKind::UnexpectedEof)));
@@ -116,7 +135,7 @@ impl AsyncWrite for NcpStreamWriter {
                 }
             };
             let seg_len = seg_data.len();
-            match me.write_tx.send(seg_data) {
+            match me.write_tx.send(WriteCmd::Data(seg_data)) {
                 Ok(()) => {
                     sent += seg_len;
                     me.write_wnd -= 1;
@@ -136,7 +155,27 @@ impl AsyncWrite for NcpStreamWriter {
         unimplemented!()
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        unimplemented!()
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let me = &mut *self;
+        if !me.closing {
+            log::debug!("===== send close");
+            match me.write_tx.send(WriteCmd::Close) {
+                Ok(()) => me.closing = true,
+                Err(_) => return Poll::Ready(Err(Error::from(ErrorKind::UnexpectedEof))),
+            };
+        }
+        loop {
+            match me.write_noty.poll_recv(cx) {
+                Poll::Ready(Some(n)) => match n {
+                    WriterNoty::WindowInc(_) => (),
+                    WriterNoty::Closed => return Poll::Ready(Ok(())),
+                },
+                Poll::Ready(None) => {
+                    log::debug!("ncp_loop closed before. it's not likely to happen");
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }

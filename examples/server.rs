@@ -6,15 +6,24 @@ use tokio::io::AsyncReadExt;
 async fn run() -> Result<()> {
     let listen_addr: SocketAddr = "127.0.0.1:7774".parse()?;
     let (_write_stream, mut read_stream) = serve(listen_addr).await?;
+    /*
     let mut buf = BytesMut::with_capacity(1500);
     loop {
         buf.resize(1500, 0u8);
         log::debug!("before read");
         let size = read_stream.read(buf.as_mut()).await?;
+        if size.eq(&0) {
+            log::debug!("read eof");
+            break;
+        }
         let msg = buf.as_ref()[..size].to_vec();
         log::debug!("after read: {}", pretty_hex::pretty_hex(&msg));
     }
-    tokio::time::delay_for(std::time::Duration::from_secs(100)).await;
+     */
+    let mut buf: String = String::new();
+    read_stream.read_to_string(&mut buf).await?;
+    log::debug!("read string: {}", buf);
+    tokio::time::delay_for(std::time::Duration::from_secs(2)).await;
     Ok(())
 }
 

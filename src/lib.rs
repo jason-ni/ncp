@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::frame::{read_frame, write_frame, write_frame_to, NcpFrame, CMD_ACK, CMD_PUSH};
-use crate::stream::WriterNoty;
+use crate::stream::{ReadNoty, WriteCmd, WriterNoty};
 pub use stream::{NcpStreamReader, NcpStreamWriter};
 use tokio::net::udp::SendHalf;
 use tokio::sync::mpsc::error::TrySendError;
@@ -25,24 +25,31 @@ pub struct NcpStreamInner {
     send_buf: VecDeque<NcpSegment>,
     recv_next: u32,
     recv_buf: VecDeque<NcpSegment>,
+    now: u32,
+    closing: bool,
+    closing_sn: u32,
 }
 
+#[derive(Debug)]
 enum SegState {
     Init,
     WaitAck,
     Sent,
 }
 
+#[derive(Debug)]
 pub struct NcpSegment {
     seg_no: u32,
     state: SegState,
-    data: Vec<u8>,
+    timestamp: u32,
+    data: Option<Vec<u8>>,
 }
 
 enum HandleMsg {
     RecvData(NcpFrame, SocketAddr),
     WriteData(Vec<u8>),
     CheckResend,
+    Close,
 }
 
 async fn run_with_log<F>(f: F) -> core::result::Result<(), ()>
@@ -78,6 +85,7 @@ pub async fn conn(remote_addr: SocketAddr) -> Result<(NcpStreamWriter, NcpStream
             write_wnd: 16,
             write_tx,
             write_noty,
+            closing: false,
         },
         NcpStreamReader {
             pending_buf: None,
@@ -103,6 +111,7 @@ pub async fn serve(local_addr: SocketAddr) -> Result<(NcpStreamWriter, NcpStream
             write_wnd: 16,
             write_tx,
             write_noty,
+            closing: false,
         },
         NcpStreamReader {
             pending_buf: None,
@@ -114,8 +123,8 @@ pub async fn serve(local_addr: SocketAddr) -> Result<(NcpStreamWriter, NcpStream
 
 async fn ncp_loop(
     udp_sock: UdpSocket,
-    mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    mut read_tx: mpsc::Sender<Vec<u8>>,
+    mut write_rx: mpsc::UnboundedReceiver<WriteCmd>,
+    mut read_tx: mpsc::Sender<ReadNoty>,
     mut write_noty_tx: mpsc::UnboundedSender<WriterNoty>,
 ) -> Result<()> {
     let mut ncp_inner = NcpStreamInner {
@@ -128,6 +137,9 @@ async fn ncp_loop(
         send_buf: Default::default(),
         recv_next: 0,
         recv_buf: Default::default(),
+        now: 0,
+        closing: false,
+        closing_sn: 0,
     };
     let (mut sock_recv_hf, mut sock_send_hf) = udp_sock.split();
     let mut buf = BytesMut::with_capacity(1024);
@@ -142,6 +154,7 @@ async fn ncp_loop(
                     Ok((size, peer_addr)) => {
                         log::debug!("received data: {:?}", &buf[..size]);
                         let frame = read_frame(&buf[..size]);
+                        log::debug!("received frame: {:?}", frame);
                         HandleMsg::RecvData(frame, peer_addr)
                     }
                     Err(e) => {
@@ -151,17 +164,30 @@ async fn ncp_loop(
             },
             res = write_rx.recv() => {
                 match res {
-                    Some(write_data) => {
-                        log::debug!("writing segment data: {:?}",write_data);
-                        HandleMsg::WriteData(write_data)
+                    Some(write_cmd) => {
+                        log::debug!("writing segment data: {:?}",write_cmd);
+                        match write_cmd {
+                            WriteCmd::Data(d) => {
+                                HandleMsg::WriteData(d)
+                            }
+                            WriteCmd::Close => {
+                                HandleMsg::Close
+                            }
+                        }
                     }
-                    None => continue
+                    None => {
+                        log::debug!("writer dropped, closing loop...");
+                        return Ok(())
+                    }
                 }
             }
             _ = check_arp_inverval.tick() => {
                 HandleMsg::CheckResend
             }
         };
+
+        ncp_inner.now = now_millis();
+
         match msg {
             HandleMsg::RecvData(frame, peer_addr) => match frame.cmd {
                 CMD_PUSH => {
@@ -188,32 +214,69 @@ async fn ncp_loop(
                             NcpSegment {
                                 seg_no: frame.sn,
                                 state: SegState::Init,
-                                data: frame.data,
+                                timestamp: frame.ts,
+                                data: if frame.data.len().eq(&0) {
+                                    None
+                                } else {
+                                    Some(frame.data)
+                                },
                             },
                         );
+                        log::debug!("inserted seg to recv_buf: {:?}", ncp_inner.recv_buf);
                         send_ack(frame.sn, &mut sock_send_hf, &peer_addr).await?;
                     }
                 }
                 CMD_ACK => {
+                    log::debug!("send_buf: {:?}", ncp_inner.send_buf);
+                    log::debug!("send_queue: {:?}", ncp_inner.send_queue);
                     for i in ncp_inner.send_buf.iter_mut() {
+                        log::debug!(
+                            "checking ack seg_no: {}, frame.sn: {}, frame.len: {}",
+                            i.seg_no,
+                            frame.sn,
+                            frame.len
+                        );
                         if i.seg_no.eq(&frame.sn) {
                             log::debug!("=== setting segment {} to sent state", i.seg_no);
                             i.state = SegState::Sent;
                         }
                     }
-                    while let Some(i) = ncp_inner.send_buf.pop_front() {
-                        log::debug!("=== send_una: {}, seg_no: {}", ncp_inner.send_una, i.seg_no);
-                        if i.seg_no.eq(&ncp_inner.send_una) {
-                            ncp_inner.send_una = i.seg_no + 1;
-                            ncp_inner.write_wnd += 1;
-                            log::debug!("=== sendint increasing write wnd noty");
-                            let _ = write_noty_tx.send(WriterNoty::WindowInc(1)).map_err(|e| {
-                                log::error!("send WindowInc error: {:?}", e);
-                            });
-                        } else {
-                            ncp_inner.send_buf.push_front(i);
-                            break;
+                    let mut pop_count = 0;
+                    for i in ncp_inner.send_buf.iter_mut() {
+                        match i.state {
+                            SegState::Sent => {
+                                if i.seg_no.eq(&ncp_inner.send_una) {
+                                    ncp_inner.send_una = i.seg_no + 1;
+                                    ncp_inner.write_wnd += 1;
+                                    pop_count += 1;
+                                    match i.data {
+                                        Some(ref _d) => {
+                                            log::debug!("=== send increasing write wnd noty");
+                                            let _ = write_noty_tx
+                                                .send(WriterNoty::WindowInc(1))
+                                                .map_err(|e| {
+                                                    log::error!("send WindowInc error: {:?}", e);
+                                                });
+                                        }
+                                        None => {
+                                            log::debug!("=== send write close noty");
+                                            let _ = write_noty_tx.send(WriterNoty::Closed).map_err(
+                                                |e| {
+                                                    log::error!("send WindowInc error: {:?}", e);
+                                                },
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ => break,
                         }
+                    }
+                    while pop_count > 0 {
+                        ncp_inner.send_buf.pop_front();
+                        pop_count -= 1;
                     }
                 }
                 other_cmd => unimplemented!(),
@@ -224,13 +287,24 @@ async fn ncp_loop(
                 ncp_inner.send_queue.push_back(NcpSegment {
                     seg_no,
                     state: SegState::Init,
-                    data: write_data,
+                    timestamp: ncp_inner.now,
+                    data: Some(write_data),
                 });
                 ncp_inner.write_wnd -= 1;
             }
             HandleMsg::CheckResend => {
                 log::debug!("checking resend: recv_next: {}", ncp_inner.recv_next);
-                continue;
+            }
+            HandleMsg::Close => {
+                log::debug!("closing stream");
+                let seg_no = ncp_inner.send_sn;
+                ncp_inner.send_sn += 1;
+                ncp_inner.send_queue.push_back(NcpSegment {
+                    seg_no,
+                    state: SegState::Init,
+                    timestamp: ncp_inner.now,
+                    data: None,
+                });
             }
         };
 
@@ -242,6 +316,7 @@ async fn ncp_loop(
                     if pending_seg_size.le(&(1 + ncp_inner.send_wnd_limit as usize)) {
                         log::debug!("pop send queue to send buf: {}", seg.seg_no);
                         seg.state = SegState::WaitAck;
+                        seg.timestamp = ncp_inner.now;
                         send_segment(&seg, &mut sock_send_hf).await?;
                         ncp_inner.send_buf.push_back(seg);
                     } else {
@@ -257,12 +332,40 @@ async fn ncp_loop(
         }
 
         while let Some(mut seg) = ncp_inner.recv_buf.pop_front() {
+            log::debug!("checking recv seg: {:?}", seg);
             if seg.seg_no.eq(&ncp_inner.recv_next) {
-                match read_tx.try_send(seg.data) {
-                    Ok(()) => ncp_inner.recv_next += 1,
+                let mut closing = false;
+                let read_noty = match seg.data {
+                    Some(ref _data) => {
+                        let data = seg.data.take().unwrap();
+                        ReadNoty::Data(data)
+                    }
+                    None => {
+                        log::debug!("set closing...");
+                        closing = true;
+                        ReadNoty::Eof
+                    }
+                };
+                match read_tx.try_send(read_noty) {
+                    Ok(()) => {
+                        ncp_inner.recv_next += 1;
+                        if closing {
+                            let _ = write_noty_tx.send(WriterNoty::Closed).map_err(|e| {
+                                log::error!("failed to send WriterNoty::Closed");
+                            });
+                            //TODO: maybe we need delay exiting loop
+                            log::debug!("exiting loop as closed");
+                            return Ok(());
+                        }
+                    }
                     Err(TrySendError::Closed(_)) => unimplemented!(),
-                    Err(TrySendError::Full(data)) => {
-                        seg.data = data;
+                    Err(TrySendError::Full(noty)) => {
+                        match noty {
+                            ReadNoty::Data(d) => {
+                                seg.data.replace(d);
+                            }
+                            ReadNoty::Eof => (),
+                        }
                         ncp_inner.recv_buf.push_front(seg);
                         break;
                     }
@@ -275,16 +378,20 @@ async fn ncp_loop(
 }
 
 async fn send_segment(seg: &NcpSegment, write_stream: &mut SendHalf) -> Result<()> {
+    let (len, data) = match &seg.data {
+        Some(d) => (d.len(), d.clone()),
+        None => (0, Vec::new()),
+    };
     let frame = NcpFrame {
         conv: 0,
         cmd: 0,
         frg: 0,
         wnd: 0,
-        ts: 0,
+        ts: seg.timestamp,
         sn: seg.seg_no,
         una: 0,
-        len: seg.data.len() as u32,
-        data: seg.data.clone(),
+        len: len as u32,
+        data,
     };
     log::debug!("before write frame");
     write_frame(write_stream, &frame).await?;
@@ -307,4 +414,12 @@ async fn send_ack(seg_no: u32, write_stream: &mut SendHalf, peer_addr: &SocketAd
     };
     write_frame_to(write_stream, &frame, peer_addr).await?;
     Ok(())
+}
+
+#[inline(always)]
+fn now_millis() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u32
 }
