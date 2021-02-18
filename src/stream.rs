@@ -123,18 +123,10 @@ impl AsyncWrite for NcpStreamWriter {
         }
         let mut cursor = buf;
         let mut sent: usize = 0;
-        let mut last_seg: Option<Vec<u8>> = None;
         while cursor.has_remaining() {
-            let seg_data = match last_seg {
-                Some(_) => last_seg.take().unwrap(),
-                None => {
-                    let seg_len = min(cursor.remaining(), crate::frame::MSS as usize);
-                    let seg_data = cursor[..seg_len].to_vec();
-                    cursor.advance(seg_len);
-                    seg_data
-                }
-            };
-            let seg_len = seg_data.len();
+            let seg_len = min(cursor.remaining(), crate::frame::MSS as usize);
+            let seg_data = cursor[..seg_len].to_vec();
+            cursor.advance(seg_len);
             match me.write_tx.send(WriteCmd::Data(seg_data)) {
                 Ok(()) => {
                     sent += seg_len;

@@ -89,7 +89,7 @@ pub async fn conn(remote_addr: SocketAddr) -> Result<(NcpStreamWriter, NcpStream
     )));
     Ok((
         NcpStreamWriter {
-            write_wnd: 16,
+            write_wnd: 64,
             write_tx,
             write_noty,
             closing: false,
@@ -115,7 +115,7 @@ pub async fn serve(local_addr: SocketAddr) -> Result<(NcpStreamWriter, NcpStream
     )));
     Ok((
         NcpStreamWriter {
-            write_wnd: 16,
+            write_wnd: 64,
             write_tx,
             write_noty,
             closing: false,
@@ -135,8 +135,8 @@ async fn ncp_loop(
     mut write_noty_tx: mpsc::UnboundedSender<WriterNoty>,
 ) -> Result<()> {
     let mut ncp_inner = NcpStreamInner {
-        write_wnd: 16,
-        send_wnd_limit: 16,
+        write_wnd: 64,
+        send_wnd_limit: 64,
         send_sn: 0,
         send_una: 0,
         send_next: 0,
@@ -152,18 +152,20 @@ async fn ncp_loop(
         rttval: 0,
     };
     let (mut sock_recv_hf, mut sock_send_hf) = udp_sock.split();
-    let mut buf = BytesMut::with_capacity(1024);
-    let mut check_arp_inverval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut buf = BytesMut::with_capacity(1400);
+    let mut check_arp_inverval = tokio::time::interval(std::time::Duration::from_millis(200));
+    let wait = tokio::time::delay_for(std::time::Duration::from_millis(100));
     loop {
-        log::debug!("loop begin");
-        buf.resize(1024, 0u8);
+        log::trace!("loop begin");
+        buf.resize(1400, 0u8);
         let msg = tokio::select! {
             res = sock_recv_hf.recv_from(buf.as_mut()) => {
                 match res {
                     Ok((size, peer_addr)) => {
-                        log::debug!("received data: {:?}", &buf[..size]);
+                        log::debug!("received data: {}", pretty_hex::pretty_hex(&buf[..size].to_vec()));
                         let frame = read_frame(&buf[..size]);
-                        log::debug!("received frame: {:?}", frame);
+                        //log::debug!("received frame: {:?}", frame);
+                        /*
                         log::debug!("whether to drop: {} - {}", ncp_inner.now, (ncp_inner.now % 50));
                         fastrand::seed(now_millis() as u64);
                         let threshold = fastrand::u32(..20);
@@ -171,6 +173,7 @@ async fn ncp_loop(
                             log::debug!("--- error injection: drop segment {} intentionally. threshold: {}", frame.sn, threshold);
                             continue
                         }
+                         */
                         HandleMsg::RecvData(frame, peer_addr)
                     }
                     Err(e) => {
@@ -207,7 +210,7 @@ async fn ncp_loop(
         match msg {
             HandleMsg::RecvData(frame, peer_addr) => match frame.cmd {
                 CMD_PUSH => {
-                    log::debug!("received push data: {:?}", &frame);
+                    log::debug!("received push data: {}", &frame.sn);
                     log::debug!("recv_buf: {:?}", ncp_inner.recv_buf);
                     if frame.sn.lt(&ncp_inner.recv_next) {
                         send_ack(frame.sn, ncp_inner.recv_next, &mut sock_send_hf, &peer_addr)
@@ -329,7 +332,7 @@ async fn ncp_loop(
                 ncp_inner.write_wnd -= 1;
             }
             HandleMsg::CheckResend => {
-                log::debug!("checking resend: recv_next: {}", ncp_inner.recv_next);
+                log::trace!("checking resend: recv_next: {}", ncp_inner.recv_next);
                 for i in ncp_inner.send_buf.iter_mut() {
                     let diff = i32diff(ncp_inner.now, i.rexmit_timestamp);
                     if diff.ge(&0) {

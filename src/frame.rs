@@ -5,8 +5,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::udp::SendHalf;
 
 pub const MTU: u16 = 1400; //TODO: assuming transport layer MTU is larger than 1400
-                           //pub const MSS: u16 = MTU - 24;
-pub const MSS: u16 = MTU - 1398;
+pub const MSS: u16 = MTU - 24;
+//pub const MSS: u16 = MTU - 1398;
 
 pub const CMD_PUSH: u8 = 0;
 pub const CMD_ACK: u8 = 1;
